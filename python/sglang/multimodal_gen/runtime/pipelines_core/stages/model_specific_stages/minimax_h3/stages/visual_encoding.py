@@ -236,6 +236,15 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
             )
         encoded = []
         rows_list = []
+        # 两阶段采样支持：直接在像素空间为一采 Draft 编码清晰高质量的原生潜空间条件 (杜绝 Latent 插值模糊)
+        import os
+        from PIL import Image
+        two_stage_enabled = os.environ.get("AGNES_TWO_STAGE_SAMPLING", "0").strip().lower() in ("1", "true", "yes")
+        scale_factor = float(os.environ.get("AGNES_TWO_STAGE_SCALE_FACTOR", "2.0")) if two_stage_enabled else 1.0
+        draft_rows_list = []
+        draft_h = None
+        draft_w = None
+
         # One VAE dtype toggle for the whole signature (up to two keyframes),
         # not one per keyframe.
         with minimax_h3_scoped_encode_fp32(self.video_vae):
@@ -263,9 +272,22 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
                     }
                 )
                 rows_list.append(rows)
+
+                # 在像素空间通过 Lanczos 算法为一采生成清晰的原生 Draft 潜空间条件
+                if two_stage_enabled and scale_factor > 1.0:
+                    draft_w = (int(round(width / scale_factor)) // 16) * 16
+                    draft_h = (int(round(height / scale_factor)) // 16) * 16
+                    draft_img = image.resize((draft_w, draft_h), Image.Resampling.LANCZOS)
+                    draft_r = minimax_h3_encode_keyframe_cond_rows(
+                        self.video_vae,
+                        draft_img,
+                        self.vae_arch_config,
+                    )
+                    draft_rows_list.append(draft_r)
+
         rows = rows_list[0] if len(rows_list) == 1 else torch.cat(rows_list, dim=0)
         first = encoded[0]
-        batch.extra[MINIMAX_H3_KEYFRAME_COND_ROWS_EXTRA_KEY] = {
+        payload = {
             "rows": rows,
             "latent_h": first["latent_h"],
             "latent_w": first["latent_w"],
@@ -276,6 +298,12 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
             "pixel_frame_indices": prepared.get("pixel_frame_indices"),
             "frame_count": prepared.get("frame_count"),
         }
+        if draft_rows_list and draft_h is not None and draft_w is not None:
+            draft_cat = draft_rows_list[0] if len(draft_rows_list) == 1 else torch.cat(draft_rows_list, dim=0)
+            payload["draft_rows"] = draft_cat
+            payload["draft_latent_h"] = draft_h // 16
+            payload["draft_latent_w"] = draft_w // 16
+        batch.extra[MINIMAX_H3_KEYFRAME_COND_ROWS_EXTRA_KEY] = payload
 
     def _encode_reference_video(self, batch: Req, plan) -> None:
         """ref2va video/video_audio encode from shared transformed frames."""

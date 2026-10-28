@@ -257,6 +257,96 @@ def _cat_optional(rows: list[torch.Tensor]) -> torch.Tensor | None:
     return rows[0] if len(rows) == 1 else torch.cat(rows, dim=0)
 
 
+def _even_half_latent_dim(dim: int, scale_factor: float) -> int:
+    """Match draft-canvas rounding: /scale_factor, then even for 2x2 patchify."""
+
+    return max(2, int(round(int(dim) / float(scale_factor))) // 2 * 2)
+
+
+def _halve_ref2va_visual_conditions(
+    blocks: list[dict[str, int | str]],
+    visual_rows: torch.Tensor | None,
+    *,
+    scale_factor: float,
+) -> tuple[list[dict[str, int | str]], torch.Tensor | None, list[str]]:
+    """Spatially halve ref2va image/video tokens for two-stage draft denoise.
+
+    Audio blocks are left unchanged. Each visual block keeps its own temporal
+    length; only latent H/W follow the generation-canvas scale_factor.
+    """
+
+    if visual_rows is None:
+        return [dict(block) for block in blocks], None, []
+
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_tokens import (
+        minimax_h3_resize_video_token_rows,
+    )
+
+    cursor = 0
+    new_blocks: list[dict[str, int | str]] = []
+    new_parts: list[torch.Tensor] = []
+    notes: list[str] = []
+    n_visual = int(visual_rows.shape[0])
+    for block in blocks:
+        new_block = dict(block)
+        kind = str(block["kind"])
+        if kind == "image":
+            src_h = int(block["latent_h"])
+            src_w = int(block["latent_w"])
+            n_rows = (src_h // 2) * (src_w // 2)
+            chunk = visual_rows[cursor : cursor + n_rows]
+            cursor += n_rows
+            dst_h = _even_half_latent_dim(src_h, scale_factor)
+            dst_w = _even_half_latent_dim(src_w, scale_factor)
+            if (dst_h, dst_w) != (src_h, src_w):
+                chunk = minimax_h3_resize_video_token_rows(
+                    chunk,
+                    src_latent_h=src_h,
+                    src_latent_w=src_w,
+                    dst_latent_h=dst_h,
+                    dst_latent_w=dst_w,
+                )
+            new_block["latent_h"] = dst_h
+            new_block["latent_w"] = dst_w
+            new_parts.append(chunk)
+            notes.append(
+                f"image {src_h}x{src_w} -> {dst_h}x{dst_w} "
+                f"({n_rows} -> {int(chunk.shape[0])} rows)"
+            )
+        elif kind in {"video", "video_audio"}:
+            src_h = int(block["latent_h"])
+            src_w = int(block["latent_w"])
+            latent_t = int(block["latent_t"])
+            n_rows = latent_t * (src_h // 2) * (src_w // 2)
+            chunk = visual_rows[cursor : cursor + n_rows]
+            cursor += n_rows
+            dst_h = _even_half_latent_dim(src_h, scale_factor)
+            dst_w = _even_half_latent_dim(src_w, scale_factor)
+            if (dst_h, dst_w) != (src_h, src_w):
+                chunk = minimax_h3_resize_video_token_rows(
+                    chunk,
+                    src_latent_h=src_h,
+                    src_latent_w=src_w,
+                    dst_latent_h=dst_h,
+                    dst_latent_w=dst_w,
+                )
+            new_block["latent_h"] = dst_h
+            new_block["latent_w"] = dst_w
+            new_parts.append(chunk)
+            notes.append(
+                f"{kind} T={latent_t} {src_h}x{src_w} -> {dst_h}x{dst_w} "
+                f"({n_rows} -> {int(chunk.shape[0])} rows)"
+            )
+        new_blocks.append(new_block)
+    if cursor != n_visual:
+        raise ValueError(
+            "ref2va visual rows did not match block layout while halving for "
+            f"draft denoise: consumed={cursor} actual={n_visual}"
+        )
+    halved = _cat_optional(new_parts)
+    return new_blocks, halved, notes
+
+
 def _ref2va_ordered_blocks_and_rows(
     *,
     plan: Any,
@@ -350,11 +440,15 @@ def _resolve_denoise_model(
     return model.to(device).eval()
 
 
+_REFINED_PROMPT_EMBEDS_KEY = "_minimax_h3_refined_prompt_embeds"
+
+
 def _precompute_refined_prompt_embeds(
     model: Any,
     positive: Any,
     *,
     device: torch.device,
+    shared_conditioning: dict[str, Any] | None = None,
 ) -> bool:
     """Move request-static text refinement out of the denoise hot loop."""
     refine = getattr(model, "refine_prompt_embeds", None)
@@ -363,17 +457,23 @@ def _precompute_refined_prompt_embeds(
 
     static_kwargs = positive.static_kwargs
     prompt_embeds = static_kwargs["prompt_embeds"]
-    refiner_params = static_kwargs["refiner_packed_seq_params"]
-    if isinstance(refiner_params, dict):
-        refiner_cu = refiner_params["cu_seqlens_q"]
-    else:
-        refiner_cu = refiner_params.cu_seqlens_q
-    with torch.inference_mode():
-        refined = refine(
-            prompt_embeds,
-            refiner_cu,
-            device=device,
-        )
+    refined = (
+        shared_conditioning.get(_REFINED_PROMPT_EMBEDS_KEY)
+        if shared_conditioning is not None
+        else None
+    )
+    if refined is None:
+        refiner_params = static_kwargs["refiner_packed_seq_params"]
+        if isinstance(refiner_params, dict):
+            refiner_cu = refiner_params["cu_seqlens_q"]
+        else:
+            refiner_cu = refiner_params.cu_seqlens_q
+        with torch.inference_mode():
+            refined = refine(
+                prompt_embeds,
+                refiner_cu,
+                device=device,
+            )
     if not torch.is_tensor(refined):
         raise TypeError("MiniMax H3 refine_prompt_embeds must return a torch.Tensor")
     if int(refined.shape[0]) != int(prompt_embeds.shape[0]):
@@ -381,6 +481,8 @@ def _precompute_refined_prompt_embeds(
             "MiniMax H3 refined prompt row count changed: "
             f"{int(prompt_embeds.shape[0])} -> {int(refined.shape[0])}"
         )
+    if shared_conditioning is not None:
+        shared_conditioning.setdefault(_REFINED_PROMPT_EMBEDS_KEY, refined)
     static_kwargs["prompt_embeds"] = refined
     static_kwargs["refined_prompt_embeds_length"] = int(refined.shape[0])
     return True
@@ -635,12 +737,6 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         _assemble_condition_rows(ctx)
 
         emb = ctx.embeddings["positive"]
-        packed = _build_packed_layout(ctx, emb)
-        tags = packed["token_tags"]
-        tags[packed["text_pos"].view(-1)] = (
-            emb["text_token_tags"].view(-1).to(torch.long)
-        )
-
         sampling = batch.sampling_params
         imgvid_noise_aug, audio_noise_aug = minimax_h3_condition_noise_aug(sampling)
         _apply_condition_noise_aug(
@@ -648,6 +744,62 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             sampling=sampling,
             imgvid_noise_aug=imgvid_noise_aug,
             audio_noise_aug=audio_noise_aug,
+        )
+
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.latent_upscaler_3d import (
+            TwoStageDenoiseManager,
+            is_two_stage_enabled,
+        )
+
+        two_stage_active = is_two_stage_enabled(batch=batch, server_args=server_args)
+        split_step = 4
+        scale_factor = 2.0
+        upscaler_path = None
+        if two_stage_active:
+            sp = getattr(batch, "sampling_params", None)
+            if sp is not None:
+                split_step = int(getattr(sp, "two_stage_split_step", 4) or 4)
+                scale_factor = float(getattr(sp, "two_stage_scale_factor", 2.0) or 2.0)
+                upscaler_path = getattr(sp, "two_stage_upscaler_path", None)
+            elif isinstance(batch.extra, dict):
+                split_step = int(batch.extra.get("two_stage_split_step", 4) or 4)
+                scale_factor = float(batch.extra.get("two_stage_scale_factor", 2.0) or 2.0)
+                upscaler_path = batch.extra.get("two_stage_upscaler_path")
+
+        stage2_ref_blocks = None
+        stage2_ref_cond = None
+        if (
+            two_stage_active
+            and ctx.is_ref2va
+            and ctx.cond_rows is not None
+            and ctx.ref2va_positive_blocks is not None
+        ):
+            stage2_ref_blocks = [dict(block) for block in ctx.ref2va_positive_blocks]
+            stage2_ref_cond = ctx.cond_rows
+            ctx.ref2va_positive_blocks, ctx.cond_rows, ref_notes = (
+                _halve_ref2va_visual_conditions(
+                    ctx.ref2va_positive_blocks,
+                    ctx.cond_rows,
+                    scale_factor=scale_factor,
+                )
+            )
+            from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+                get_world_rank,
+                world_group_is_initialized,
+            )
+
+            if not world_group_is_initialized() or get_world_rank() == 0:
+                detail = "; ".join(ref_notes) if ref_notes else "unchanged"
+                print(
+                    ">>> [TwoStage] 参考条件对齐到一采 Draft 潜空间 "
+                    f"(scale={scale_factor:g}x): {detail}",
+                    flush=True,
+                )
+
+        packed = _build_packed_layout(ctx, emb)
+        tags = packed["token_tags"]
+        tags[packed["text_pos"].view(-1)] = (
+            emb["text_token_tags"].view(-1).to(device=tags.device, dtype=torch.long)
         )
 
         placement_managed = self._component_residency_manager is not None
@@ -669,6 +821,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 model,
                 positive,
                 device=device,
+                shared_conditioning=emb,
             )
             _precompute_rope_cache(
                 model,
@@ -676,14 +829,130 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 device=device,
             )
             initial_video, initial_audio = _expand_initial_rows(ctx, positive)
+
+            two_stage_mgr = None
+            if two_stage_active:
+                import os
+                if not upscaler_path:
+                    upscaler_path = os.environ.get("MINIMAX_H3_UPSCALER_PATH")
+
+                model_dtype = torch.float32 if (upscaler_path and "fp32" in upscaler_path.lower()) else torch.float16
+                mgr_kwargs = {
+                    "enabled": True,
+                    "split_step": split_step,
+                    "scale_factor": scale_factor,
+                    "device": device,
+                    "dtype": model_dtype,
+                }
+                if upscaler_path:
+                    mgr_kwargs["model_path"] = upscaler_path
+                two_stage_mgr = TwoStageDenoiseManager(**mgr_kwargs)
+                from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+                    get_world_rank,
+                    world_group_is_initialized,
+                )
+                is_main_rank = not world_group_is_initialized() or get_world_rank() == 0
+                if is_main_rank:
+                    print(
+                        f"\n>>> [TwoStage] TwoStageDenoiseManager 已成功挂载 (转折步数={split_step}, 权重={upscaler_path})\n",
+                        flush=True,
+                    )
+
+            def rebuild_layout_fn(new_h: int, new_w: int) -> tuple[Any, Any]:
+                """【转折点核心回调】当视频潜空间从 Draft 放大至高清后，动态重构 Packed 序列与注意力元数据。"""
+                if stage2_ref_blocks is not None:
+                    ctx.ref2va_positive_blocks = stage2_ref_blocks
+                    ctx.cond_rows = stage2_ref_cond
+                ctx.latent_h = new_h
+                ctx.latent_w = new_w
+                new_packed = _build_packed_layout(ctx, emb)
+                new_tags = new_packed["token_tags"]
+                new_tags[new_packed["text_pos"].view(-1)] = (
+                    emb["text_token_tags"]
+                    .view(-1)
+                    .to(device=new_tags.device, dtype=torch.long)
+                )
+                new_positive = MiniMaxH3DenoiseBranch(
+                    packed=new_packed,
+                    text_embeddings=emb["hidden_states"],
+                    token_tags=new_tags,
+                    device=device,
+                )
+                _precompute_refined_prompt_embeds(
+                    model,
+                    new_positive,
+                    device=device,
+                    shared_conditioning=emb,
+                )
+                _precompute_rope_cache(
+                    model,
+                    new_positive,
+                    device=device,
+                )
+                return new_positive, None
+
+            loop_output_state: dict[str, Any] = {}
+            total_loop_steps = len(sigmas_video) - 1
+
+            req_seed = 42
+            if hasattr(batch, "sampling_params") and batch.sampling_params is not None:
+                req_seed = getattr(batch.sampling_params, "seed", 42) or 42
+            elif hasattr(ctx, "plan") and ctx.plan is not None:
+                req_seed = getattr(ctx.plan, "seed", 42) or 42
+
+            stage1_cond_rows = ctx.cond_rows
+            stage2_cond_rows = None
+            stage2_cond_hw = None
+            if two_stage_mgr is not None and getattr(two_stage_mgr, "enabled", False):
+                # 首帧按请求画布编码，一采布局却是半分辨率。优先使用像素级 Lanczos 编码的真实潜空间！
+                if ctx.cond_rows is not None and ctx.keyframe is not None:
+                    src_h = int(ctx.keyframe["latent_h"])
+                    src_w = int(ctx.keyframe["latent_w"])
+                    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+                        get_world_rank,
+                        world_group_is_initialized,
+                    )
+                    is_master_rank = not world_group_is_initialized() or get_world_rank() == 0
+
+                    if "draft_rows" in ctx.keyframe and ctx.keyframe["draft_rows"] is not None:
+                        stage1_cond_rows = ctx.keyframe["draft_rows"].to(
+                            device=ctx.cond_rows.device, dtype=ctx.cond_rows.dtype
+                        )
+                        stage2_cond_rows = ctx.cond_rows
+                        stage2_cond_hw = (src_h, src_w)
+                        if is_master_rank:
+                            print(
+                                ">>> [TwoStage-PixelLanczos] 启用像素空间 Lanczos 原生编码的 Draft 首尾帧条件 "
+                                f"({int(stage1_cond_rows.shape[0])} rows)，彻底杜绝 Latent 插值模糊！",
+                                flush=True,
+                            )
+                    elif src_h != int(ctx.latent_h) or src_w != int(ctx.latent_w):
+                        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_tokens import (
+                            minimax_h3_resize_video_token_rows,
+                        )
+
+                        stage1_cond_rows = minimax_h3_resize_video_token_rows(
+                            ctx.cond_rows,
+                            src_latent_h=src_h,
+                            src_latent_w=src_w,
+                            dst_latent_h=int(ctx.latent_h),
+                            dst_latent_w=int(ctx.latent_w),
+                        )
+                        stage2_cond_rows = ctx.cond_rows
+                        stage2_cond_hw = (src_h, src_w)
+                        if is_master_rank:
+                            print(
+                                ">>> [TwoStage] 首帧条件对齐到一采 Draft 潜空间 "
+                                f"{src_h}x{src_w} -> {int(ctx.latent_h)}x{int(ctx.latent_w)} "
+                                f"({int(ctx.cond_rows.shape[0])} -> {int(stage1_cond_rows.shape[0])} rows)",
+                                flush=True,
+                            )
+
             with (
                 maybe_nvtx_range("denoising_loop", self.current_use_nvtx),
-                # The loop runs len(sigmas_video) - 1 forwards; that count is
-                # authoritative here and nowhere else, and sparge_attn's tail
-                # cutoff cannot identify the last step without it.
-                _denoise_total_steps_ctx(len(sigmas_video) - 1),
+                _denoise_total_steps_ctx(total_loop_steps),
                 self.progress_bar(
-                    total=len(sigmas_video) - 1,
+                    total=total_loop_steps,
                     batch=batch,
                     desc="minimax_h3 denoise",
                 ) as progress_bar,
@@ -700,7 +969,13 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     positive=positive,
                     initial_video_rows=initial_video,
                     initial_audio_rows=initial_audio,
-                    keyframe_cond_rows=ctx.cond_rows,
+                    keyframe_cond_rows=stage1_cond_rows,
+                    stage2_keyframe_cond_rows=stage2_cond_rows,
+                    stage2_keyframe_latent_hw=stage2_cond_hw,
+                    raw_keyframe_rows=ctx.keyframe["rows"] if ctx.keyframe is not None else None,
+                    keyframe_frame_indices=ctx.keyframe_frame_indices if ctx.keyframe is not None else None,
+                    keyframe_frame_count=ctx.keyframe_frame_count if ctx.keyframe is not None else None,
+                    stage2_layout_cond_rows=stage2_ref_cond,
                     audio_ref_rows=ctx.audio_ref_rows,
                     sigmas_video=sigmas_video,
                     sigmas_audio=[float(v) for v in ctx.sigmas["audio"]],
@@ -712,7 +987,59 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                         self._profile_denoising_step,
                         batch=batch,
                     ),
+                    two_stage_manager=two_stage_mgr,
+                    rebuild_layout_fn=rebuild_layout_fn if two_stage_mgr else None,
+                    current_latent_dims=(ctx.latent_t, ctx.latent_h, ctx.latent_w) if two_stage_mgr else None,
+                    target_latent_hw=_two_stage_target_latent_hw(ctx) if two_stage_mgr else None,
+                    output_state=loop_output_state,
+                    seed=int(req_seed),
                 )
+
+            if "positive" in loop_output_state:
+                positive = loop_output_state["positive"]
+            if "latent_h" in loop_output_state:
+                ctx.latent_h = loop_output_state["latent_h"]
+            if "latent_w" in loop_output_state:
+                ctx.latent_w = loop_output_state["latent_w"]
+            if "stage1_x0_latents" in loop_output_state:
+                from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
+                    MINIMAX_H3_STAGE1_NOISY_XT_LATENT_HW_EXTRA_KEY,
+                    MINIMAX_H3_STAGE1_NOISY_XT_LATENTS_EXTRA_KEY,
+                    MINIMAX_H3_STAGE1_X0_LATENT_HW_EXTRA_KEY,
+                    MINIMAX_H3_STAGE1_X0_LATENTS_EXTRA_KEY,
+                    MINIMAX_H3_STAGE1_UPSCALED_X0_LATENT_HW_EXTRA_KEY,
+                    MINIMAX_H3_STAGE1_UPSCALED_X0_LATENTS_EXTRA_KEY,
+                    MINIMAX_H3_STAGE2_NOISED_XT_LATENT_HW_EXTRA_KEY,
+                    MINIMAX_H3_STAGE2_NOISED_XT_LATENTS_EXTRA_KEY,
+                )
+
+                if "stage1_noisy_xt_latents" in loop_output_state:
+                    batch.extra[MINIMAX_H3_STAGE1_NOISY_XT_LATENTS_EXTRA_KEY] = (
+                        loop_output_state["stage1_noisy_xt_latents"]
+                    )
+                    batch.extra[MINIMAX_H3_STAGE1_NOISY_XT_LATENT_HW_EXTRA_KEY] = (
+                        loop_output_state.get("stage1_noisy_xt_latent_hw")
+                    )
+                batch.extra[MINIMAX_H3_STAGE1_X0_LATENTS_EXTRA_KEY] = loop_output_state[
+                    "stage1_x0_latents"
+                ]
+                batch.extra[MINIMAX_H3_STAGE1_X0_LATENT_HW_EXTRA_KEY] = (
+                    loop_output_state.get("stage1_x0_latent_hw")
+                )
+                if "stage1_upscaled_x0_latents" in loop_output_state:
+                    batch.extra[MINIMAX_H3_STAGE1_UPSCALED_X0_LATENTS_EXTRA_KEY] = (
+                        loop_output_state["stage1_upscaled_x0_latents"]
+                    )
+                    batch.extra[MINIMAX_H3_STAGE1_UPSCALED_X0_LATENT_HW_EXTRA_KEY] = (
+                        loop_output_state.get("stage1_upscaled_x0_latent_hw")
+                    )
+                if "stage2_noised_xt_latents" in loop_output_state:
+                    batch.extra[MINIMAX_H3_STAGE2_NOISED_XT_LATENTS_EXTRA_KEY] = (
+                        loop_output_state["stage2_noised_xt_latents"]
+                    )
+                    batch.extra[MINIMAX_H3_STAGE2_NOISED_XT_LATENT_HW_EXTRA_KEY] = (
+                        loop_output_state.get("stage2_noised_xt_latent_hw")
+                    )
         finally:
             self._finish_active_component_use()
         _publish_full_loop_outputs(
@@ -773,6 +1100,27 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             [V.is_tensor, V.with_dims(3)],
         )
         return result
+
+
+def _two_stage_target_latent_hw(ctx: "_FullLoopContext") -> tuple[int, int] | None:
+    """二采超分必须落回的请求潜空间。没记下目标尺寸时保持超分器自己的对齐结果。"""
+
+    state = ctx.state if isinstance(ctx.state, dict) else None
+    if state is None:
+        return None
+    raw_h = state.get("target_latent_h")
+    raw_w = state.get("target_latent_w")
+    if raw_h is None or raw_w is None:
+        return None
+    target_h, target_w = int(raw_h), int(raw_w)
+    if target_h <= 0 or target_w <= 0:
+        return None
+    if target_h % 2 or target_w % 2:
+        target_h -= target_h % 2
+        target_w -= target_w % 2
+    if target_h <= 0 or target_w <= 0:
+        return None
+    return target_h, target_w
 
 
 class _FullLoopContext:
@@ -1061,6 +1409,9 @@ def _publish_full_loop_outputs(
     batch.audio_latents = minimax_h3_unpack_audio_tokens(
         audio_target_rows, audio_t=ctx.audio_t * 2, audio_channel=2
     )
+    if isinstance(ctx.state, dict):
+        ctx.state["latent_h"] = ctx.latent_h
+        ctx.state["latent_w"] = ctx.latent_w
 
 
 __all__ = [

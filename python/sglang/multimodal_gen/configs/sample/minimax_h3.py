@@ -57,6 +57,10 @@ class MiniMaxH3SamplingParams(SamplingParams):
         default=None,
         metadata={"batch_sig_exclude": True},
     )
+    two_stage_sampling: bool = False
+    two_stage_split_step: int = 4
+    two_stage_scale_factor: float = 2.0
+    two_stage_upscaler_path: str | None = None
 
     @classmethod
     def video_request_extra_fields(cls) -> frozenset[str]:
@@ -71,6 +75,10 @@ class MiniMaxH3SamplingParams(SamplingParams):
                 "output_mode",
                 "imgvid_cond_noise_aug_for_inference",
                 "audio_cond_noise_aug_for_inference",
+                "two_stage_sampling",
+                "two_stage_split_step",
+                "two_stage_scale_factor",
+                "two_stage_upscaler_path",
             }
         )
 
@@ -281,6 +289,12 @@ class MiniMaxH3SamplingParams(SamplingParams):
                 "task is required when conditions/target/flow_shift/"
                 "audio_flow_shift are provided"
             )
+        if self.two_stage_sampling:
+            extra["two_stage_sampling"] = True
+            extra["two_stage_split_step"] = self.two_stage_split_step
+            extra["two_stage_scale_factor"] = self.two_stage_scale_factor
+            if self.two_stage_upscaler_path:
+                extra["two_stage_upscaler_path"] = self.two_stage_upscaler_path
         return extra
 
     def refresh_request_extra_after_output_expansion(self, req: Any) -> None:

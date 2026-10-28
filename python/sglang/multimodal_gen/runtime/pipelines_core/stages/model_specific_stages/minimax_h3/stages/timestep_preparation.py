@@ -151,11 +151,17 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
                 task_default=plan.default_audio_flow_shift,
             ),
         }
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.latent_upscaler_3d import (
+            is_two_stage_enabled,
+        )
+        is_two_stage = is_two_stage_enabled(batch=batch)
+
         sigmas: dict[str, list[float]] = {}
         for modality in ("video", "audio"):
             sigmas[modality] = minimax_h3_time_shift_sigmas(
                 num_steps=requested_num_steps,
                 shift_scale=scales[modality],
+                two_stage=is_two_stage,
             )
         batch.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY] = sigmas
 

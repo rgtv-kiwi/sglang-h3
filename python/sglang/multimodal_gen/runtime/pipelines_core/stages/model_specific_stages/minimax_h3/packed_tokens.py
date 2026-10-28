@@ -70,6 +70,62 @@ def minimax_h3_unpatchify_video_tokens(
     return latent.reshape(-1, channel, t * pt, h * ph, w * pw).contiguous()
 
 
+def minimax_h3_resize_video_token_rows(
+    rows: torch.Tensor,
+    *,
+    src_latent_h: int,
+    src_latent_w: int,
+    dst_latent_h: int,
+    dst_latent_w: int,
+    patch_size: Sequence[int] = (1, 2, 2),
+    channels: int = 24,
+) -> torch.Tensor:
+    """Spatially resize packed video/keyframe token rows between latent grids.
+
+    Each frame keeps its own temporal slot. Only H/W change, so a first-frame
+    and a last-frame condition are not blended into each other.
+    """
+
+    _rank(rows, "video token rows", 2)
+    pt, ph, pw = _int_tuple(patch_size, "patch_size", 3)
+    src_h, src_w = int(src_latent_h), int(src_latent_w)
+    dst_h, dst_w = int(dst_latent_h), int(dst_latent_w)
+    if src_h % ph or src_w % pw or dst_h % ph or dst_w % pw:
+        raise ValueError(
+            "latent spatial size must be divisible by patch size: "
+            f"src=({src_h}, {src_w}), dst=({dst_h}, {dst_w}), patch={[pt, ph, pw]}"
+        )
+    if (src_h, src_w) == (dst_h, dst_w):
+        return rows
+    token_h, token_w = src_h // ph, src_w // pw
+    frame_rows = token_h * token_w
+    n_rows = int(rows.shape[0])
+    if frame_rows <= 0 or n_rows % frame_rows:
+        raise ValueError(
+            f"video rows {n_rows} must be a multiple of one source frame "
+            f"({frame_rows}) for latent {(src_h, src_w)}"
+        )
+    n_frames = n_rows // frame_rows
+    latent = minimax_h3_unpatchify_video_tokens(
+        rows,
+        latent_shape=(n_frames, token_h, token_w, int(channels)),
+        patch_size=(pt, ph, pw),
+    )
+    _, channel, frames, _, _ = (int(dim) for dim in latent.shape)
+    flat = latent.permute(0, 2, 1, 3, 4).reshape(frames, channel, src_h, src_w)
+    resized = torch.nn.functional.interpolate(
+        flat,
+        size=(dst_h, dst_w),
+        mode="bilinear",
+        align_corners=False,
+    )
+    resized = resized.reshape(1, frames, channel, dst_h, dst_w).permute(0, 2, 1, 3, 4)
+    return minimax_h3_patchify_video_latent(
+        resized.contiguous(),
+        patch_size=(pt, ph, pw),
+    ).to(dtype=rows.dtype)
+
+
 def minimax_h3_unpack_audio_tokens(
     rows: torch.Tensor,
     *,
@@ -99,6 +155,8 @@ def minimax_h3_unpack_audio_tokens(
 
 __all__ = [
     "minimax_h3_patchify_video_latent",
+    "minimax_h3_resize_video_token_rows",
     "minimax_h3_unpack_audio_tokens",
     "minimax_h3_unpatchify_video_tokens",
 ]
+

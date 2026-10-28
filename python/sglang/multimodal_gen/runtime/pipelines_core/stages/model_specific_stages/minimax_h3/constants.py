@@ -19,6 +19,15 @@ MINIMAX_H3_REFERENCE_IMAGE_ROWS_EXTRA_KEY = "minimax_h3_reference_image_rows"
 MINIMAX_H3_REFERENCE_AUDIO_ROWS_EXTRA_KEY = "minimax_h3_reference_audio_rows"
 MINIMAX_H3_REFERENCE_VIDEO_ROWS_EXTRA_KEY = "minimax_h3_reference_video_rows"
 MINIMAX_H3_PREPARED_REFERENCE_VIDEO_EXTRA_KEY = "minimax_h3_prepared_reference_video"
+# Two-stage debug dump: Stage-1 predicted x0 video latent [B,C,T,H,W] at draft size.
+MINIMAX_H3_STAGE1_NOISY_XT_LATENTS_EXTRA_KEY = "minimax_h3_stage1_noisy_xt_latents"
+MINIMAX_H3_STAGE1_NOISY_XT_LATENT_HW_EXTRA_KEY = "minimax_h3_stage1_noisy_xt_latent_hw"
+MINIMAX_H3_STAGE1_X0_LATENTS_EXTRA_KEY = "minimax_h3_stage1_x0_latents"
+MINIMAX_H3_STAGE1_X0_LATENT_HW_EXTRA_KEY = "minimax_h3_stage1_x0_latent_hw"
+MINIMAX_H3_STAGE1_UPSCALED_X0_LATENTS_EXTRA_KEY = "minimax_h3_stage1_upscaled_x0_latents"
+MINIMAX_H3_STAGE1_UPSCALED_X0_LATENT_HW_EXTRA_KEY = "minimax_h3_stage1_upscaled_x0_latent_hw"
+MINIMAX_H3_STAGE2_NOISED_XT_LATENTS_EXTRA_KEY = "minimax_h3_stage2_noised_xt_latents"
+MINIMAX_H3_STAGE2_NOISED_XT_LATENT_HW_EXTRA_KEY = "minimax_h3_stage2_noised_xt_latent_hw"
 
 MINIMAX_H3_SUPPORTED_FPS = 24
 MINIMAX_H3_MIN_DURATION_SECONDS = 4.0

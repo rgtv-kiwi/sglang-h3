@@ -94,7 +94,42 @@ class MiniMaxH3LatentPreparationStage(PipelineStage):
         seed = plan.seed
         if seed is None:
             seed = 42  # pinned default seed
-        video_rows_n = latent_t * (latent_h // 2) * (latent_w // 2)
+
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.latent_upscaler_3d import (
+            is_two_stage_enabled,
+        )
+
+        # 检查是否激活两阶段 (二采) 模式
+        two_stage = is_two_stage_enabled(batch=batch)
+        init_latent_h = latent_h
+        init_latent_w = latent_w
+        scale_factor = 2.0
+        split_step = 4
+
+        if two_stage:
+            sp = getattr(batch, "sampling_params", None)
+            if sp is not None:
+                scale_factor = float(getattr(sp, "two_stage_scale_factor", 2.0) or 2.0)
+                split_step = int(getattr(sp, "two_stage_split_step", 4) or 4)
+            elif isinstance(batch.extra, dict):
+                scale_factor = float(batch.extra.get("two_stage_scale_factor", 2.0) or 2.0)
+                split_step = int(batch.extra.get("two_stage_split_step", 4) or 4)
+            # 一采 Draft 画布分辨率计算：
+            # 1. 空间宽高各缩小 scale_factor 倍（默认 2.0x，面积为 1/4）；
+            # 2. 强制偶数对齐 (// 2 * 2)，确保后续 2x2 空间 Patchify 能够整除无截断；
+            # 3. 初始低清潜空间将在转折点由 3D Latent Upscaler 精准放大回目标 (latent_h, latent_w)。
+            init_latent_h = max(2, int(round(latent_h / scale_factor)) // 2 * 2)
+            init_latent_w = max(2, int(round(latent_w / scale_factor)) // 2 * 2)
+            from sglang.multimodal_gen.runtime.distributed.parallel_state import get_world_rank, world_group_is_initialized
+            is_main_rank = not world_group_is_initialized() or get_world_rank() == 0
+            if is_main_rank:
+                print(
+                    f"\n>>> [TwoStage] 两阶段采样已启用: 初始Draft潜空间 ({latent_t}, {init_latent_h}, {init_latent_w}) "
+                    f"-> 目标超分潜空间 ({latent_t}, {latent_h}, {latent_w}), 切换步数={split_step}, 缩放倍率={scale_factor}x\n",
+                    flush=True,
+                )
+
+        video_rows_n = latent_t * (init_latent_h // 2) * (init_latent_w // 2)
         audio_rows_n = audio_t * 2
         # Noise semantics:
         # - video noise is drawn on the RAW latent tensor
@@ -114,8 +149,8 @@ class MiniMaxH3LatentPreparationStage(PipelineStage):
             1,
             24,
             latent_t,
-            latent_h,
-            latent_w,
+            init_latent_h,
+            init_latent_w,
             generator=gen_v,
             dtype=torch.float32,
         )
@@ -135,8 +170,13 @@ class MiniMaxH3LatentPreparationStage(PipelineStage):
             "initial_video_rows": video_noise,
             "initial_audio_rows": audio_noise,
             "latent_t": latent_t,
-            "latent_h": latent_h,
-            "latent_w": latent_w,
+            "latent_h": init_latent_h,
+            "latent_w": init_latent_w,
+            "target_latent_h": latent_h,
+            "target_latent_w": latent_w,
+            "two_stage_enabled": two_stage,
+            "two_stage_split_step": split_step,
+            "two_stage_scale_factor": scale_factor,
             "audio_t": audio_t,
         }
 

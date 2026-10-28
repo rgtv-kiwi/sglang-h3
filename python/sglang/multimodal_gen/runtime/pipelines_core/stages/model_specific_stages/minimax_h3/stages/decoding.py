@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import functools
+import os
 from collections.abc import Mapping
+from datetime import datetime
+from pathlib import Path
 
 import torch
 
@@ -124,6 +127,121 @@ def _crop_to_target_canvas(batch: Req, frames: torch.Tensor) -> torch.Tensor:
     if h == target_h and w == target_w:
         return frames
     return frames[..., :target_h, :target_w]
+
+
+def _maybe_dump_stage1_x0_video(
+    batch: Req,
+    *,
+    server_args: ServerArgs,
+    video_vae,
+    video_decode,
+    visual_arch_config,
+    video_vae_dtype,
+    visual_autocast_enabled: bool,
+) -> None:
+    """Decode Stage-1 predicted x0 at draft resolution and write an mp4.
+
+    Enabled by MINIMAX_H3_DUMP_STAGE1_X0=1. Output dir:
+    MINIMAX_H3_DUMP_STAGE1_X0_DIR (default /root/批量测试/outputs/stage1_x0).
+    """
+
+    flag = os.environ.get("MINIMAX_H3_DUMP_STAGE1_X0", "").strip()
+    if flag in ("", "0", "false", "False"):
+        return
+    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+        get_world_rank,
+        world_group_is_initialized,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
+        MINIMAX_H3_STAGE1_NOISY_XT_LATENT_HW_EXTRA_KEY,
+        MINIMAX_H3_STAGE1_NOISY_XT_LATENTS_EXTRA_KEY,
+        MINIMAX_H3_STAGE1_X0_LATENT_HW_EXTRA_KEY,
+        MINIMAX_H3_STAGE1_X0_LATENTS_EXTRA_KEY,
+        MINIMAX_H3_STAGE1_UPSCALED_X0_LATENT_HW_EXTRA_KEY,
+        MINIMAX_H3_STAGE1_UPSCALED_X0_LATENTS_EXTRA_KEY,
+        MINIMAX_H3_STAGE2_NOISED_XT_LATENT_HW_EXTRA_KEY,
+        MINIMAX_H3_STAGE2_NOISED_XT_LATENTS_EXTRA_KEY,
+        MINIMAX_H3_SUPPORTED_FPS,
+    )
+    import imageio
+
+    extra = getattr(batch, "extra", None)
+    if not isinstance(extra, Mapping):
+        return
+
+    dump_targets = [
+        ("01_stage1_noisy_xt", MINIMAX_H3_STAGE1_NOISY_XT_LATENTS_EXTRA_KEY, MINIMAX_H3_STAGE1_NOISY_XT_LATENT_HW_EXTRA_KEY),
+        ("02_stage1_predicted_clean_x0", MINIMAX_H3_STAGE1_X0_LATENTS_EXTRA_KEY, MINIMAX_H3_STAGE1_X0_LATENT_HW_EXTRA_KEY),
+        ("03_stage1_upscaled_clean_x0", MINIMAX_H3_STAGE1_UPSCALED_X0_LATENTS_EXTRA_KEY, MINIMAX_H3_STAGE1_UPSCALED_X0_LATENT_HW_EXTRA_KEY),
+        ("04_stage2_noised_xt", MINIMAX_H3_STAGE2_NOISED_XT_LATENTS_EXTRA_KEY, MINIMAX_H3_STAGE2_NOISED_XT_LATENT_HW_EXTRA_KEY),
+    ]
+
+    dump_dir = Path(
+        os.environ.get(
+            "MINIMAX_H3_DUMP_STAGE1_X0_DIR",
+            "/root/批量测试/outputs/stage1_x0",
+        )
+    )
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    is_master = (not world_group_is_initialized()) or get_world_rank() == 0
+
+    for prefix, l_key, hw_key in dump_targets:
+        latents = extra.get(l_key)
+        if not isinstance(latents, torch.Tensor):
+            continue
+        hw = extra.get(hw_key) or ()
+        if len(hw) != 2:
+            continue
+        target_h, target_w = int(hw[0]) * 16, int(hw[1]) * 16
+        decode_latent = _reverse_normalize_latents(
+            latents,
+            mean_values=visual_arch_config.latents_mean,
+            std_values=visual_arch_config.latents_std,
+            name=f"video_vae_{prefix}",
+        )
+        with torch.autocast(
+            device_type=latents.device.type,
+            dtype=video_vae_dtype,
+            enabled=visual_autocast_enabled,
+        ):
+            frames = video_decode(decode_latent)
+            frames = video_vae.processor.revert_tensor(frames)
+            frames = _required_tensor(frames, f"video_vae.processor.revert_tensor({prefix})")
+            frames = _canonical_visual_video_frames(
+                frames, batch_size=int(latents.shape[0])
+            )
+        h, w = int(frames.shape[-2]), int(frames.shape[-1])
+        if h < target_h or w < target_w:
+            raise ValueError(
+                f"{prefix} decode {h}x{w} smaller than canvas {target_h}x{target_w}"
+            )
+        frames = frames[..., :target_h, :target_w]
+        if not is_master:
+            continue
+
+        path = dump_dir / f"{prefix}_{target_w}x{target_h}_{stamp}.mp4"
+        clip = frames[0].detach().float().clamp(0, 1)
+        np_frames = (
+            (clip.permute(1, 2, 3, 0) * 255.0)
+            .round()
+            .to(torch.uint8)
+            .cpu()
+            .numpy()
+        )
+        imageio.mimsave(
+            str(path),
+            list(np_frames),
+            fps=int(MINIMAX_H3_SUPPORTED_FPS),
+            format="mp4",
+            codec="libx264",
+            quality=7,
+        )
+        print(
+            f">>> [TwoStage] dumped {prefix} video {path} "
+            f"({target_w}x{target_h}, T={int(np_frames.shape[0])})",
+            flush=True,
+        )
 
 
 def _canonical_visual_video_frames(
@@ -373,6 +491,15 @@ class MiniMaxH3DecodingStage(DecodingStage):
                     visual_frames, batch_size=int(visual_latent.shape[0])
                 )
                 visual_frames = _crop_to_target_canvas(batch, visual_frames)
+                _maybe_dump_stage1_x0_video(
+                    batch,
+                    server_args=server_args,
+                    video_vae=selected_video_vae,
+                    video_decode=video_decode,
+                    visual_arch_config=visual_arch_config,
+                    video_vae_dtype=video_vae_dtype,
+                    visual_autocast_enabled=visual_autocast_enabled,
+                )
                 if (
                     visual_frames.dtype != torch.float32
                     or not visual_frames.is_contiguous()
